@@ -1,90 +1,90 @@
-"""S11 重复键与 S12 未来时间戳：可被 pytest 收集的断言版。
+"""S11 / S12 / scope — unittest only.
 
-上一版是 `def main()` 的脚本，`pytest` 收集 0 条——等于没测。这里改成
-`test_*` 函数并在同一进程里断言，避免"跑了一遍但没人读结果"。
+仓库 CI 用 `python -m unittest discover`，**没有 pytest**。上一版引入了
+pytest（`tmp_path` fixture），在 main 上直接让 "Run fixtures" 步骤 ImportError。
+这里改为纯标准库 unittest，任何环境都能跑。
 """
 import json
-import pathlib
+import os
 import shutil
 import subprocess
 import sys
-
-import pytest
+import tempfile
+import unittest
+import pathlib
 
 HERE = pathlib.Path(__file__).resolve().parent
-FIX = HERE / "fixtures"
-sys.path.insert(0, str(HERE))
+FIX = HERE.parent / "fixtures"
+sys.path.insert(0, str(HERE.parent))
 from iverify import independent_verify  # noqa: E402
 
 
-def _run(pkg):
-    p = subprocess.run([sys.executable, str(HERE / "ivcli.py"), str(pkg)],
+def _run_cli(pkg):
+    p = subprocess.run([sys.executable, str(HERE.parent / "ivcli.py"), str(pkg)],
                        capture_output=True, text=True, encoding="utf-8")
     return json.loads(p.stdout), p.returncode
 
 
-def _dupkey_copy(dst):
-    if dst.exists():
-        shutil.rmtree(dst)
-    shutil.copytree(FIX / "clean.uibc", dst)
-    mf = dst / "manifest.json"
-    raw = mf.read_text(encoding="utf-8")
-    assert raw.lstrip().startswith("{")
-    mf.write_text(raw.replace("{", '{"dup_probe": 1, "dup_probe": 2,', 1), encoding="utf-8")
+class TestS11S12Scope(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="uibc-iv-")
+        self.clean = os.path.join(self.tmp, "clean.uibc")
+        shutil.copytree(str(FIX / "clean.uibc"), self.clean)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _dupkey(self):
+        pkg = os.path.join(self.tmp, "dupkey.uibc")
+        shutil.copytree(str(FIX / "clean.uibc"), pkg)
+        mf = os.path.join(pkg, "manifest.json")
+        with open(mf, encoding="utf-8") as f:
+            raw = f.read()
+        self.assertTrue(raw.lstrip().startswith("{"))
+        with open(mf, "w", encoding="utf-8") as f:
+            f.write(raw.replace("{", '{"dup_probe": 1, "dup_probe": 2,', 1))
+        return pkg
+
+    def test_clean_fixture_passes_s11_and_s12(self):
+        out, _ = _run_cli(self.clean)
+        self.assertEqual(out["checks"]["V10"], "PASS")
+        self.assertEqual(out["checks"]["V11"], "PASS")
+
+    def test_duplicate_member_is_refused(self):
+        out, rc = _run_cli(self._dupkey())
+        self.assertEqual(out["checks"]["V10"], "FAIL")
+        self.assertEqual(out["result"], "FAIL")
+        self.assertEqual(rc, 1)
+
+    def test_duplicate_member_differs_from_clean(self):
+        self.assertEqual(independent_verify(self.clean)["checks"]["V10"], "PASS")
+        self.assertEqual(independent_verify(self._dupkey())["checks"]["V10"], "FAIL")
+
+    def test_future_timestamp_is_failed(self):
+        pkg = os.path.join(self.tmp, "future.uibc")
+        shutil.copytree(str(FIX / "clean.uibc"), pkg)
+        lc = os.path.join(pkg, "lifecycle.json")
+        with open(lc, encoding="utf-8") as f:
+            doc = json.load(f)
+        doc["events"][-1]["timestamp"] = "2099-01-01T00:00:00Z"
+        with open(lc, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        out = independent_verify(pkg)
+        self.assertEqual(out["checks"]["V11"], "FAIL")
+        self.assertTrue(any("future-timestamp" in p for p in out["timestampProblems"]))
+
+    def test_past_timestamp_tolerated(self):
+        out = independent_verify(self.clean)
+        self.assertEqual(out["checks"]["V11"], "PASS")
+
+    def test_pass_carries_scope(self):
+        out = independent_verify(self.clean)
+        if out["result"] == "PASS":
+            self.assertTrue(out["scope"], "PASS 未带范围声明")
+            self.assertTrue(out["scope"]["notEstablished"], "PASS 未声明未建立项")
+            overlap = set(out["scope"]["established"]) & set(out["scope"]["notEstablished"])
+            self.assertFalse(overlap)
 
 
-def test_clean_fixture_is_not_refused(tmp_path):
-    pkg = tmp_path / "clean.uibc"
-    shutil.copytree(FIX / "clean.uibc", pkg)
-    out, rc = _run(pkg)
-    assert out["checks"]["V10"] == "PASS"
-    assert out["checks"]["V11"] == "PASS"
-
-
-def test_duplicate_member_is_refused(tmp_path):
-    pkg = tmp_path / "dupkey.uibc"
-    _dupkey_copy(pkg)
-    out, rc = _run(pkg)
-    assert out["checks"]["V10"] == "FAIL", out
-    assert out["result"] == "FAIL"
-    assert rc == 1
-
-
-def test_duplicate_member_changes_verdict_vs_clean(tmp_path):
-    clean = tmp_path / "clean.uibc"
-    dup = tmp_path / "dup.uibc"
-    shutil.copytree(FIX / "clean.uibc", clean)
-    _dupkey_copy(dup)
-    assert independent_verify(str(clean))["checks"]["V10"] == "PASS"
-    assert independent_verify(str(dup))["checks"]["V10"] == "FAIL"
-
-
-def test_future_timestamp_is_failed(tmp_path):
-    pkg = tmp_path / "future.uibc"
-    shutil.copytree(FIX / "clean.uibc", pkg)
-    lc = pkg / "lifecycle.json"
-    doc = json.loads(lc.read_text(encoding="utf-8"))
-    doc["events"][-1]["timestamp"] = "2099-01-01T00:00:00Z"
-    lc.write_text(json.dumps(doc), encoding="utf-8")
-    out = independent_verify(str(pkg))
-    assert out["checks"]["V11"] == "FAIL"
-    assert any("future-timestamp" in p for p in out["timestampProblems"])
-
-
-def test_past_timestamp_tolerated(tmp_path):
-    pkg = tmp_path / "past.uibc"
-    shutil.copytree(FIX / "clean.uibc", pkg)
-    out = independent_verify(str(pkg))
-    assert out["checks"]["V11"] == "PASS"
-
-
-def test_pass_carries_scope(tmp_path):
-    """凡是 PASS 都必须带 established/notEstablished；带不了就不许白给 PASS。"""
-    pkg = tmp_path / "clean.uibc"
-    shutil.copytree(FIX / "clean.uibc", pkg)
-    out = independent_verify(str(pkg))
-    if out["result"] == "PASS":
-        assert out["scope"], "PASS 未带范围声明"
-        assert out["scope"]["notEstablished"], "PASS 未声明未建立的项"
-        overlap = set(out["scope"]["established"]) & set(out["scope"]["notEstablished"])
-        assert not overlap, overlap
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
