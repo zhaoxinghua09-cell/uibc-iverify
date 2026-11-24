@@ -24,6 +24,15 @@ import json
 import math
 import os
 
+COVERAGE = {
+    "implemented": {"V1": "S1a", "V2": "S2p", "V3": "S3p", "V4": "S4", "V5": "S5",
+                    "V6": "S6", "V7": "S1b", "V8": "S7", "V9": "S8", "V10": "S11",
+                    "V11": "S12"},
+    "partial": ["S1", "S2", "S3"],
+    "notImplemented": ["S9", "S10", "S13", "S14", "S15", "S16", "S17", "S18"],
+    "policy": "A PASS here means: none of the implemented checks objected. It is NOT a statement about the checks this implementation does not perform.",
+}
+
 REQUIRED = ["manifest.json", "identity.json", "lifecycle.json", "evidence/index.json"]
 KNOWN_EVENTS = {"REGISTER", "ACTIVATE", "UPDATE", "TRANSFER", "DELEGATE",
                 "MIGRATE", "SUSPEND", "RESUME", "REVOKE", "RETIRE"}
@@ -32,6 +41,49 @@ KNOWN_EVIDENCE_TYPES = {
     "IDENTITY", "LIFECYCLE", "INPUT", "ACTION", "TOOL", "MEMORY", "OUTPUT",
     "EVALUATION", "HUMAN_DECISION", "VERIFICATION", "INCIDENT", "RETIREMENT",
 }
+
+# --- PATCH: S11 strict serialization, before any parse -----------------------
+def strict_violations(raw: bytes) -> list:
+    """S11: refuse duplicate member names / undecodable bytes BEFORE loading.
+
+    json.load cannot see a duplicate member: the last one silently wins. The
+    spec puts S11 first precisely so a verifier never has to trust the parser.
+    """
+    problems = []
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return [f"S11:not-utf8@{e.start}"]
+    def _hook(pairs):
+        keys = [k for k, _ in pairs]
+        if len(keys) != len(set(keys)):
+            dup = sorted({k for k in keys if keys.count(k) > 1})
+            problems.append("S11:duplicate-member:" + ",".join(dup))
+        return dict(pairs)
+    try:
+        json.loads(text, object_pairs_hook=_hook)
+    except Exception as e:
+        problems.append("S11:unparsable:" + type(e).__name__)
+    return problems
+
+
+def preflight_s11(package_dir: str) -> str:
+    """PASS / FAIL over the JSON files this verifier reads."""
+    files = list(REQUIRED) + ["signatures/seal.json"]
+    for rel in files:
+        p = os.path.join(package_dir, rel)
+        if rel == "evidence/index.json" or rel not in REQUIRED:
+            if not os.path.isfile(p):
+                continue
+        if not os.path.isfile(p):
+            continue
+        with open(p, "rb") as f:
+            raw = f.read()
+        if strict_violations(raw):
+            return "FAIL"
+    return "PASS"
+# --- END PATCH -------------------------------------------------------------
+
 
 
 def _jcs_number_str(x):
@@ -289,6 +341,38 @@ def checkpoint_head(lh: str, root: str, idx: str, count: int) -> str:
         "evidence_index_digest": idx, "evidence_count": count}))
 
 
+# --- PATCH: S12 freshness (future-dated events) -----------------------------
+import datetime
+import time
+
+
+def future_timestamps(events, now=None, tolerance_s=300) -> list:
+    """S12: an event stamped in the future cannot have happened yet.
+
+    Offline verifiers have no clock authority, so this is deliberately a
+    one-sided test: only *future* is suspicious, never *past*. A 300 s
+    tolerance absorbs ordinary clock skew between the recorder and the reader.
+    """
+    now = time.time() if now is None else now
+    problems = []
+    for pos, ev in enumerate(events):
+        ts = ev.get("timestamp")
+        if not ts:
+            continue
+        try:
+            dt = datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            stamp = dt.timestamp()
+        except ValueError:
+            problems.append("S12:unparsable-timestamp@%d" % pos)
+            continue
+        if stamp > now + tolerance_s:
+            problems.append("S12:future-timestamp@%d(%s)" % (pos, ts))
+    return problems
+# --- END PATCH -------------------------------------------------------------
+
+
 def undeclared_root_files(package_dir: str, entries) -> list:
     """Files in the package ROOT that the package never declares (mirrors S1).
 
@@ -316,6 +400,15 @@ def undeclared_root_files(package_dir: str, entries) -> list:
 def independent_verify(package_dir: str, key: bytes = None) -> dict:
     """Return {'result': PASS/FAIL/INCONCLUSIVE, 'checks': {V1..V6: result}}."""
     outcomes = {}
+
+    # PATCH: S11 runs before any parse or other check
+    outcomes["V10"] = preflight_s11(package_dir)
+    if outcomes["V10"] == "FAIL":
+        return {"implementer": "independent_verifier/0.1.0+patch",
+                "result": "FAIL",
+                "checks": outcomes,
+                "coverage": COVERAGE,
+                "note": "S11 refused the package before parsing; later checks not run."}
 
     outcomes["V1"] = "PASS" if all(
         os.path.isfile(os.path.join(package_dir, rel)) for rel in REQUIRED) else "FAIL"
@@ -378,6 +471,10 @@ def independent_verify(package_dir: str, key: bytes = None) -> dict:
     else:
         outcomes["V9"] = "INCONCLUSIVE"
 
+    # PATCH: S12 freshness — a future-dated event cannot have happened yet
+    ts_problems = future_timestamps(events)
+    outcomes["V11"] = "FAIL" if ts_problems else "PASS"
+
     # overall (seal v0.3 three-valued rule, same as the reference):
     # FAIL anywhere -> FAIL; unresolved INCONCLUSIVE anywhere -> INCONCLUSIVE.
     vals = list(outcomes.values())
@@ -387,6 +484,47 @@ def independent_verify(package_dir: str, key: bytes = None) -> dict:
         overall = "INCONCLUSIVE"
     else:
         overall = "PASS"
-    return {"implementer": "independent_verifier/0.1.0",
+
+    # PATCH: never PASS a package that claims evidence this verifier cannot read
+    unresolved = []
+    if manifest.get("anchor") or manifest.get("trust_anchor"):
+        unresolved.append("S15 anchor claimed but not implemented")
+    if manifest.get("timestamp_token") or manifest.get("tsa"):
+        unresolved.append("S16 RFC3161 token claimed but not implemented")
+    if manifest.get("policy_ref") or manifest.get("policy_artifact"):
+        unresolved.append("S18 policy artefact claimed but not implemented")
+    if manifest.get("merkle_proof") or manifest.get("merkle"):
+        unresolved.append("S13 merkle proof claimed but not implemented")
+    if unresolved and overall == "PASS":
+        overall = "INCONCLUSIVE"
+
+    # PATCH: PASS must say what it proved (v0.4 NOT_PASS_UNLESS_SCOPED).
+    # A bare PASS is an over-assertion: offline verification cannot see issuer
+    # anchors, RFC3161 tokens, witness quorum, near-window timestamp edits.
+    scope = None
+    if overall == "PASS":
+        established = {
+            "V1": "package-structure", "V2": "identity-binding",
+            "V3": "lifecycle-order", "V4": "content-integrity",
+            "V5": "evidence-root", "V6": "seal", "V7": "no-undeclared-root-file",
+            "V8": "index-digest", "V9": "checkpoint", "V10": "strict-serialization",
+            "V11": "freshness-future-only",
+        }
+        scope = {
+            "established": sorted({established[k] for k in outcomes
+                                  if outcomes[k] == "PASS" and k in established}),
+            "notEstablished": [
+                "issuer-anchor", "rfc3161-timestamp", "merkle-proof-inclusion",
+                "policy-binding", "witness-quorum", "revocation-current",
+                "timestamp-near-window", "lifecycle-rollback-detect",
+                "reference-nearmiss-detect",
+            ],
+        }
+
+    return {"implementer": "independent_verifier/0.1.0+patch",
             "result": overall,
-            "checks": outcomes}
+            "checks": outcomes,
+            "coverage": COVERAGE,
+            "scope": scope,
+            "timestampProblems": ts_problems,
+            "unresolvedClaims": unresolved}
